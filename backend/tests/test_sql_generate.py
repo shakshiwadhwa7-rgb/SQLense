@@ -1,6 +1,6 @@
 """Tests for the SQL generation endpoint."""
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -16,7 +16,12 @@ def test_generate_sql_success():
         "SELECT * FROM employee WHERE department = 'Sales';"
     )
 
-    with patch("app.services.sql_generator._get_client") as mock_get_client:
+    # Persistence is mocked here; history saving is covered in
+    # test_history_persistence.py.
+    with (
+        patch("app.services.sql_generator._get_client") as mock_get_client,
+        patch("app.api.routes.sql.save_generation", new_callable=AsyncMock),
+    ):
         mock_client = MagicMock()
         mock_client.chat.completions.create.return_value = mock_response
         mock_get_client.return_value = mock_client
@@ -101,9 +106,12 @@ def test_generate_sql_retry_success():
     mock_response = MagicMock()
     mock_response.choices[0].message.content = "SELECT * FROM employee;"
 
+    # Persistence is mocked here; history saving is covered in
+    # test_history_persistence.py.
     with (
         patch("app.services.sql_generator._get_client") as mock_get_client,
         patch("app.services.sql_generator.time.sleep"),
+        patch("app.api.routes.sql.save_generation", new_callable=AsyncMock),
     ):
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = [
