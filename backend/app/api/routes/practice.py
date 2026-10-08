@@ -9,6 +9,11 @@ from app.schemas.practice import (
     PracticeGenerateResponse,
 )
 from app.services.practice import evaluate_practice, generate_practice
+from app.services.practice_persistence import (
+    PracticePersistenceError,
+    save_practice_attempt,
+    save_practice_question,
+)
 
 router = APIRouter()
 
@@ -17,7 +22,7 @@ router = APIRouter()
 async def practice_generate_endpoint(request: PracticeGenerateRequest):
     """Generate a SQL practice question for a topic and difficulty."""
     try:
-        question = generate_practice(
+        question, reference_sql = generate_practice(
             topic=request.topic,
             difficulty=request.difficulty,
             schema=request.schema,
@@ -27,7 +32,23 @@ async def practice_generate_endpoint(request: PracticeGenerateRequest):
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    return PracticeGenerateResponse(question=question, schema=request.schema)
+    # Persist only after generation + reference validation succeeded.
+    try:
+        question_id = await save_practice_question(
+            question=question,
+            schema=request.schema,
+            reference_sql=reference_sql,
+            difficulty=request.difficulty,
+            topic=request.topic,
+        )
+    except PracticePersistenceError:
+        raise HTTPException(
+            status_code=500, detail="Failed to persist the practice question"
+        )
+
+    return PracticeGenerateResponse(
+        question=question, schema=request.schema, question_id=question_id
+    )
 
 
 @router.post("/evaluate", response_model=PracticeEvaluateResponse)
@@ -43,6 +64,19 @@ async def practice_evaluate_endpoint(request: PracticeEvaluateRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+    # Persist only after evaluation produced its result.
+    try:
+        await save_practice_attempt(
+            question_id=request.question_id,
+            submitted_sql=request.user_sql,
+            correct=correct,
+            feedback=feedback,
+        )
+    except PracticePersistenceError:
+        raise HTTPException(
+            status_code=500, detail="Failed to persist the practice attempt"
+        )
 
     return PracticeEvaluateResponse(
         correct=correct,

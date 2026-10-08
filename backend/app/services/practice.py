@@ -1,21 +1,45 @@
 """Practice Mode services: question generation and SQL evaluation."""
 
+import json
+
 import sqlglot
+from pydantic import BaseModel, ValidationError
 from sqlglot.errors import ErrorLevel
 from sqlglot.optimizer.qualify import qualify
 
 from app.services import sql_generator, sql_validator
 from app.services.sql_validator import validate_sql, validate_sql_against_schema
 
-GENERATE_SYSTEM_PROMPT = """You are an expert SQL instructor creating practice questions for beginners.
+GENERATE_SYSTEM_PROMPT = """You are an expert SQL instructor creating practice questions with solutions for beginners.
 
-Given a topic, a difficulty level, and a database schema, write ONE clear practice question that a learner can answer with a single read-only SQL query.
+Given a topic, a difficulty level, and a database schema, write ONE clear practice question that a learner can answer with a single read-only SQL query, together with the reference solution for that question.
 
 CRITICAL RULES:
-1. Use only tables and columns that are present in the provided schema.
-2. The question must be answerable with a single SELECT query.
-3. Match the requested difficulty: easy = simple filtering; medium = joins or aggregation; hard = CTEs, subqueries, or window functions.
-4. Return ONLY the question text — no markdown, no code fences, no solution, no extra commentary."""
+1. Use only tables and columns that are present in the provided schema — do NOT invent tables or columns.
+2. The question must be answerable with a single read-only SELECT or WITH...SELECT query.
+3. The reference SQL must solve exactly the question you wrote: same tables, same filters, same result.
+4. The reference SQL must be a single read-only SELECT or WITH...SELECT statement — never INSERT, UPDATE, DELETE, DROP, or any other write or DDL statement.
+5. Match the requested difficulty: easy = simple filtering; medium = joins or aggregation; hard = CTEs, subqueries, or window functions.
+6. Fill exactly two fields: "question" is plain text (no markdown, no code fences, no solution, no extra commentary) and "reference_sql" is the SQL query alone (no markdown code fences, no explanations, no comments)."""
+
+#: Strict Groq Structured Outputs contract for the one-call practice
+#: generation (question + reference solution in a single completion).
+PRACTICE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "practice_question",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string"},
+                "reference_sql": {"type": "string"},
+            },
+            "required": ["question", "reference_sql"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 REFERENCE_SYSTEM_PROMPT = """You are an expert SQL writer. Answer the given practice question with a single read-only SQL query.
 
@@ -48,12 +72,30 @@ EMPTY_FEEDBACK_FALLBACK = (
 )
 
 
-def _chat(system_prompt: str, user_content: str, max_tokens: int) -> str:
-    """One Groq chat completion using the existing client/model configuration."""
+def _chat(
+    system_prompt: str,
+    user_content: str,
+    max_tokens: int,
+    response_format: dict | None = None,
+) -> str:
+    """One Groq chat completion using the existing client/model configuration.
+
+    Args:
+        system_prompt: The system message for the completion.
+        user_content: The user message for the completion.
+        max_tokens: Maximum tokens allowed for the completion.
+        response_format: Optional Groq Structured Outputs contract. When
+            None (the default) the request is unchanged from the plain
+            text calls used by evaluation and feedback.
+    """
     try:
         client = sql_generator._get_client()
     except Exception as e:
         raise RuntimeError(f"Groq client initialization failed: {e}") from e
+
+    extra_kwargs: dict = {}
+    if response_format is not None:
+        extra_kwargs["response_format"] = response_format
 
     try:
         response = client.chat.completions.create(
@@ -64,6 +106,7 @@ def _chat(system_prompt: str, user_content: str, max_tokens: int) -> str:
             ],
             temperature=0,
             max_tokens=max_tokens,
+            **extra_kwargs,
         )
     except Exception as e:
         raise RuntimeError(f"Groq API call failed: {e}") from e
@@ -71,8 +114,20 @@ def _chat(system_prompt: str, user_content: str, max_tokens: int) -> str:
     return response.choices[0].message.content or ""
 
 
-def generate_practice(topic: str, difficulty: str, schema: str) -> str:
-    """Generate a practice question for a topic, difficulty, and schema.
+class _GeneratedPractice(BaseModel):
+    """Private parse model for the structured practice generation output."""
+
+    question: str
+    reference_sql: str
+
+
+def generate_practice(topic: str, difficulty: str, schema: str) -> tuple[str, str]:
+    """Generate a practice question and its reference solution in ONE call.
+
+    Makes a single Groq completion with Strict Structured Outputs so the
+    response parses reliably as {question, reference_sql}, then validates
+    the reference SQL with the existing read-only and schema validators.
+    SQL is never executed.
 
     Args:
         topic: The SQL topic to practice (e.g. "JOINs").
@@ -80,11 +135,13 @@ def generate_practice(topic: str, difficulty: str, schema: str) -> str:
         schema: The database schema the question must use.
 
     Returns:
-        The generated question text.
+        A tuple of (question, reference_sql).
 
     Raises:
         ValueError: If any input is empty.
-        RuntimeError: If Groq fails or returns an empty question.
+        RuntimeError: If Groq fails, returns malformed structured output,
+            returns an empty question or reference SQL, or the reference
+            SQL fails validation.
     """
     if not topic.strip():
         raise ValueError("Topic cannot be empty")
@@ -94,13 +151,37 @@ def generate_practice(topic: str, difficulty: str, schema: str) -> str:
         raise ValueError("Schema cannot be empty")
 
     user_content = f"Topic: {topic}\nDifficulty: {difficulty}\nSchema: {schema}"
-    question = sql_generator._strip_markdown_fences(
-        _chat(GENERATE_SYSTEM_PROMPT, user_content, max_tokens=500)
-    ).strip()
+    raw = _chat(
+        GENERATE_SYSTEM_PROMPT,
+        user_content,
+        max_tokens=700,
+        response_format=PRACTICE_RESPONSE_FORMAT,
+    )
 
+    # Strict mode guarantees schema-shaped JSON; anything we still cannot
+    # parse or validate is treated as a Groq failure (-> 502 via the route).
+    try:
+        generated = _GeneratedPractice.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, ValidationError) as e:
+        raise RuntimeError(f"Groq returned malformed practice output: {e}") from e
+
+    question = sql_generator._strip_markdown_fences(generated.question).strip()
     if not question:
         raise RuntimeError("Groq returned an empty practice question")
-    return question
+
+    reference_sql = sql_generator._strip_markdown_fences(
+        generated.reference_sql
+    ).strip()
+    if not reference_sql:
+        raise RuntimeError("Groq returned an empty reference SQL")
+
+    try:
+        validate_sql(reference_sql)
+        validate_sql_against_schema(reference_sql, schema)
+    except ValueError as e:
+        raise RuntimeError(f"Groq returned invalid reference SQL: {e}") from e
+
+    return question, reference_sql
 
 
 def _canonicalize(sql: str, sqlglot_schema: dict) -> str | None:

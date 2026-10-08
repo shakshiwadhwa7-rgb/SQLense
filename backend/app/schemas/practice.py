@@ -1,5 +1,7 @@
 """Pydantic models for Practice Mode requests and responses."""
 
+import uuid
+
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -32,6 +34,13 @@ class PracticeGenerateRequest(BaseModel):
 class PracticeGenerateResponse(BaseModel):
     question: str = Field(..., description="Generated practice question")
     schema: str = Field(..., description="Schema the question applies to")
+    question_id: uuid.UUID = Field(
+        ...,
+        description=(
+            "Stored practice_questions row id; pass it to "
+            "/practice/evaluate as question_id to persist the attempt"
+        ),
+    )
 
 
 class PracticeEvaluateRequest(BaseModel):
@@ -49,6 +58,13 @@ class PracticeEvaluateRequest(BaseModel):
         ...,
         min_length=1,
         description="The learner's SQL answer",
+    )
+    question_id: uuid.UUID | None = Field(
+        default=None,
+        description=(
+            "practice_questions row id returned by /practice/generate; "
+            "when supplied, the attempt is persisted against that question"
+        ),
     )
 
     @field_validator("question", "schema", "user_sql")
